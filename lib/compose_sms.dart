@@ -3,8 +3,9 @@ import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:telephony/telephony.dart';
 import 'package:sim_reader/sim_reader.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'show_sms.dart';
+import 'package:android_sms_reader/android_sms_reader.dart';
 import 'services/dual_sim_sms_service.dart';
+import 'show_sms.dart';
 
 class ComposeSmsPage extends StatefulWidget {
   const ComposeSmsPage({super.key});
@@ -179,7 +180,8 @@ class _ComposeSmsPageState extends State<ComposeSmsPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Select Contact'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        backgroundColor: const Color.fromARGB(255, 215, 215, 215), // Teal 700
+          foregroundColor: const Color.fromARGB(255, 0, 0, 0),
       ),
       body: Column(
         children: [
@@ -349,59 +351,13 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
       return;
     }
 
-    // If multiple SIMs, show selection dialog, otherwise send directly
-    if (simCards.length > 1) {
-      _showSimSelectionDialog();
-    } else if (selectedSim != null) {
+    // Send directly using the selected SIM (no popup)
+    if (selectedSim != null) {
       _sendDirectSms(selectedSim!.simSlotIndex ?? 0);
+    } else if (simCards.isNotEmpty) {
+      // If no SIM selected, use the first one
+      _sendDirectSms(simCards[0].simSlotIndex ?? 0);
     }
-  }
-
-  void _showSimSelectionDialog() {
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('Select SIM card'),
-          contentPadding: const EdgeInsets.symmetric(vertical: 16),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: simCards.map((sim) {
-              int slotIndex = sim.simSlotIndex ?? 0;
-              String simLabel = sim.carrierName ?? 'SIM ${slotIndex + 1}';
-              String? simNumber = sim.phoneNumber;
-              
-              return ListTile(
-                leading: CircleAvatar(
-                  backgroundColor: _getSimColor(slotIndex),
-                  child: Text(
-                    '${slotIndex + 1}',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-                title: Text(simLabel),
-                subtitle: simNumber != null && simNumber.isNotEmpty
-                    ? Text(simNumber)
-                    : const Text('No number'),
-                trailing: selectedSim?.simSlotIndex == sim.simSlotIndex
-                    ? const Icon(Icons.check_circle, color: Colors.green)
-                    : null,
-                onTap: () {
-                  Navigator.pop(context);
-                  setState(() {
-                    selectedSim = sim;
-                  });
-                  _sendDirectSms(slotIndex);
-                },
-              );
-            }).toList(),
-          ),
-        );
-      },
-    );
   }
 
   Color _getSimColor(int slotIndex) {
@@ -459,79 +415,69 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
         return;
       }
       
-      // Show sending indicator
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Row(
-              children: [
-                SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                ),
-                SizedBox(width: 16),
-                Text('Sending message...'),
-              ],
-            ),
-            duration: Duration(seconds: 3),
-          ),
-        );
-      }
-      
       // Send SMS using the custom dual SIM implementation
-      bool success = await DualSimSmsService.sendSmsBySim(
+      await DualSimSmsService.sendSmsBySim(
         phoneNumber: phoneNumber,
         message: message,
         simSlot: simSlot,
       );
       
-      if (success && mounted) {
-        // Clear message after successful send
-        _messageController.clear();
-        
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Message sent successfully from SIM ${simSlot + 1}!'),
-            backgroundColor: Colors.green,
-            duration: const Duration(seconds: 2),
-          ),
+      // Load conversation history with this contact
+      List<AndroidSMSMessage> conversationMessages = [];
+      try {
+        // Read inbox messages
+        List<AndroidSMSMessage> inboxMessages = await AndroidSMSReader.fetchMessages(
+          type: AndroidSMSType.inbox,
+          start: 0,
+          count: 5000,
         );
         
-        // Navigate to show_sms page with the conversation after a short delay
-        Future.delayed(const Duration(milliseconds: 800), () {
-          if (mounted) {
-            Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(
-                builder: (context) => ShowSmsPage(
-                  sender: widget.phoneNumber,
-                  messages: [],
-                ),
-              ),
-            );
-          }
-        });
+        // Read sent messages
+        List<AndroidSMSMessage> sentMessages = await AndroidSMSReader.fetchMessages(
+          type: AndroidSMSType.sent,
+          start: 0,
+          count: 5000,
+        );
+        
+        // Combine and filter messages for this contact
+        List<AndroidSMSMessage> allMessages = [...inboxMessages, ...sentMessages];
+        
+        // Clean phone numbers for comparison
+        String cleanTargetPhone = phoneNumber.replaceAll(RegExp(r'[\s\-\(\)]'), '');
+        
+        conversationMessages = allMessages.where((msg) {
+          String cleanMsgPhone = msg.address.replaceAll(RegExp(r'[\s\-\(\)]'), '');
+          return cleanMsgPhone.contains(cleanTargetPhone) || cleanTargetPhone.contains(cleanMsgPhone);
+        }).toList();
+        
+        print('Found ${conversationMessages.length} messages in conversation');
+      } catch (e) {
+        print('Error loading conversation: $e');
+      }
+      
+      // Navigate to conversation page showing sent message and history
+      if (mounted) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (context) => ShowSmsPage(
+              sender: widget.phoneNumber,
+              messages: conversationMessages,
+              pendingMessage: message,
+              pendingSimSlot: simSlot,
+            ),
+          ),
+        );
       }
       
     } catch (e) {
       print('Error sending SMS: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).clearSnackBars();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Failed to send SMS: ${e.toString()}'),
             backgroundColor: Colors.red,
-            duration: const Duration(seconds: 5),
-            action: SnackBarAction(
-              label: 'Retry',
-              textColor: Colors.white,
-              onPressed: () => _sendDirectSms(simSlot),
-            ),
+            duration: const Duration(seconds: 3),
           ),
         );
       }
@@ -543,7 +489,8 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.contactName),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+       backgroundColor: const Color.fromARGB(255, 215, 215, 215), // Teal 700
+          foregroundColor: const Color.fromARGB(255, 0, 0, 0),
       ),
       body: Column(
         children: [
@@ -604,53 +551,6 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
             ),
           ),
           
-          // SIM selection indicator (like Google Messages)
-          if (simCards.length > 1 && selectedSim != null)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                border: Border(
-                  bottom: BorderSide(
-                    color: Theme.of(context).colorScheme.outline.withOpacity(0.1),
-                  ),
-                ),
-              ),
-              child: InkWell(
-                onTap: _showSimSelectionDialog,
-                child: Row(
-                  children: [
-                    CircleAvatar(
-                      radius: 12,
-                      backgroundColor: _getSimColor(selectedSim!.simSlotIndex ?? 0),
-                      child: Text(
-                        '${(selectedSim!.simSlotIndex ?? 0) + 1}',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      selectedSim!.carrierName ?? 'SIM ${(selectedSim!.simSlotIndex ?? 0) + 1}',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: Theme.of(context).colorScheme.onSurface,
-                      ),
-                    ),
-                    const Spacer(),
-                    Icon(
-                      Icons.arrow_drop_down,
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          
           // Spacer
           const Expanded(child: SizedBox()),
           
@@ -669,6 +569,78 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
             ),
             child: Column(
               children: [
+                // SIM Selector - Show above message box
+                if (!isLoadingSims && simCards.isNotEmpty)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 12),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: simCards.map((sim) {
+                        int slotIndex = sim.simSlotIndex ?? 0;
+                        String simLabel = sim.carrierName ?? 'SIM ${slotIndex + 1}';
+                        bool isSelected = selectedSim?.simSlotIndex == sim.simSlotIndex;
+                        Color simColor = _getSimColor(slotIndex);
+                        
+                        return Expanded(
+                          child: InkWell(
+                            onTap: () {
+                              setState(() {
+                                selectedSim = sim;
+                              });
+                            },
+                            borderRadius: BorderRadius.circular(8),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  CircleAvatar(
+                                    radius: 10,
+                                    backgroundColor: simColor,
+                                    child: Text(
+                                      '${slotIndex + 1}',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Flexible(
+                                    child: Text(
+                                      simLabel,
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                        color: isSelected 
+                                          ? Theme.of(context).colorScheme.primary
+                                          : Theme.of(context).colorScheme.onSurface,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  if (isSelected)
+                                    Icon(
+                                      Icons.check_circle,
+                                      color: Theme.of(context).colorScheme.primary,
+                                      size: 18,
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                  
                 // Show loading or SIM count
                 if (isLoadingSims)
                   const Padding(

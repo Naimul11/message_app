@@ -3,15 +3,39 @@ import 'package:android_sms_reader/android_sms_reader.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:telephony/telephony.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
+import 'package:sim_reader/sim_reader.dart';
+import 'services/dual_sim_sms_service.dart';
+
+// Message status enum
+enum MessageStatus { sending, sent, failed }
+
+// Custom message class to track status
+class MessageWithStatus {
+  final String message;
+  final DateTime timestamp;
+  final MessageStatus status;
+  final bool isSent; // true if sent by user, false if received
+
+  MessageWithStatus({
+    required this.message,
+    required this.timestamp,
+    required this.status,
+    required this.isSent,
+  });
+}
 
 class ShowSmsPage extends StatefulWidget {
   final String sender;
   final List<AndroidSMSMessage> messages;
+  final String? pendingMessage;
+  final int? pendingSimSlot;
 
   const ShowSmsPage({
     super.key,
     required this.sender,
     required this.messages,
+    this.pendingMessage,
+    this.pendingSimSlot,
   });
 
   @override
@@ -25,7 +49,10 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
   bool canSendSms = false;
   bool isValidPhoneNumber = false;
   int? selectedSimSlot;
+  SimInfo? selectedSim;
+  List<SimInfo> simCards = [];
   List<AndroidSMSMessage> allMessages = [];
+  List<MessageWithStatus> pendingMessages = [];
   String displayName = '';
 
   @override
@@ -35,10 +62,100 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
     _loadContactName();
     _checkSendSmsPermission();
     _validatePhoneNumber();
+    _loadSimCards();
+    
+    // Handle pending message if exists
+    if (widget.pendingMessage != null && widget.pendingSimSlot != null) {
+      selectedSimSlot = widget.pendingSimSlot;
+      _sendPendingMessage(widget.pendingMessage!, widget.pendingSimSlot!);
+    }
+    
     // Scroll to bottom after the frame is built
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _scrollToBottom();
     });
+  }
+
+  Future<void> _loadSimCards() async {
+    try {
+      // Request phone permission for SIM info
+      PermissionStatus permissionStatus = await Permission.phone.request();
+      
+      if (!permissionStatus.isGranted) {
+        return;
+      }
+
+      // Get all SIM cards info
+      List<SimInfo> sims = await SimReader.getAllSimInfo();
+      
+      setState(() {
+        simCards = sims;
+        // Auto-select the first SIM if available and no SIM is already selected
+        if (simCards.isNotEmpty && selectedSim == null) {
+          selectedSim = simCards[0];
+          selectedSimSlot = selectedSim?.simSlotIndex ?? 0;
+        }
+      });
+    } catch (e) {
+      print('Error loading SIM cards: $e');
+    }
+  }
+
+  Future<void> _sendPendingMessage(String message, int simSlot) async {
+    // Add message to pending list with "sending" status
+    setState(() {
+      pendingMessages.add(MessageWithStatus(
+        message: message,
+        timestamp: DateTime.now(),
+        status: MessageStatus.sending,
+        isSent: true,
+      ));
+    });
+
+    // Scroll to bottom to show the new message
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollToBottom();
+    });
+
+    try {
+      // Send SMS using the dual SIM service
+      bool success = await DualSimSmsService.sendSmsBySim(
+        phoneNumber: widget.sender,
+        message: message,
+        simSlot: simSlot,
+      );
+
+      // Update message status
+      setState(() {
+        int index = pendingMessages.indexWhere((m) => 
+          m.message == message && m.status == MessageStatus.sending
+        );
+        if (index != -1) {
+          pendingMessages[index] = MessageWithStatus(
+            message: message,
+            timestamp: pendingMessages[index].timestamp,
+            status: success ? MessageStatus.sent : MessageStatus.failed,
+            isSent: true,
+          );
+        }
+      });
+    } catch (e) {
+      print('Error sending message: $e');
+      // Update message status to failed
+      setState(() {
+        int index = pendingMessages.indexWhere((m) => 
+          m.message == message && m.status == MessageStatus.sending
+        );
+        if (index != -1) {
+          pendingMessages[index] = MessageWithStatus(
+            message: message,
+            timestamp: pendingMessages[index].timestamp,
+            status: MessageStatus.failed,
+            isSent: true,
+          );
+        }
+      });
+    }
   }
 
   Future<void> _loadContactName() async {
@@ -119,19 +236,16 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
       return;
     }
 
-    // Ask for SIM selection first
-    int? simSlot = await _showSimSelectionDialog();
+    // Use selected SIM or first available
+    int simSlot = selectedSimSlot ?? 0;
     
-    if (simSlot == null) {
-      return; // User cancelled
-    }
-
     try {
       String messageText = _messageController.text.trim();
       String phoneNumber = widget.sender;
       
       print('Sending SMS to: $phoneNumber');
       print('Message: $messageText');
+      print('Using SIM Slot: $simSlot');
       
       // Request SMS permission first
       bool? permissionGranted = await telephony.requestSmsPermissions;
@@ -147,49 +261,47 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
         }
         return;
       }
+
+      // Add message to pending list with "sending" status
+      setState(() {
+        pendingMessages.add(MessageWithStatus(
+          message: messageText,
+          timestamp: DateTime.now(),
+          status: MessageStatus.sending,
+          isSent: true,
+        ));
+      });
       
-      // Send SMS directly using telephony
-      await telephony.sendSms(
-        to: phoneNumber,
+      // Clear message input
+      _messageController.clear();
+
+      // Scroll to bottom to show the new message
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToBottom();
+      });
+      
+      // Send SMS using the dual SIM service
+      bool success = await DualSimSmsService.sendSmsBySim(
+        phoneNumber: phoneNumber,
         message: messageText,
-        statusListener: (SendStatus status) {
-          print('SMS Send Status: $status');
-          if (mounted) {
-            if (status == SendStatus.SENT) {
-              // Add sent message to the list
-              setState(() {
-                allMessages.add(AndroidSMSMessage(
-                  id: DateTime.now().millisecondsSinceEpoch,
-                  address: phoneNumber,
-                  body: messageText,
-                  date: DateTime.now().millisecondsSinceEpoch,
-                  type: "2", // TYPE_SENT
-                ));
-              });
-              
-              _messageController.clear();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Message sent successfully!'),
-                  backgroundColor: Colors.green,
-                ),
-              );
-              
-              // Scroll to bottom to show new message
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                _scrollToBottom();
-              });
-            } else if (status == SendStatus.DELIVERED) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Message delivered!'),
-                  backgroundColor: Colors.green,
-                ),
-              );
-            }
-          }
-        },
+        simSlot: simSlot,
       );
+
+      // Update message status
+      setState(() {
+        int index = pendingMessages.indexWhere((m) => 
+          m.message == messageText && m.status == MessageStatus.sending
+        );
+        
+        if (index != -1) {
+          pendingMessages[index] = MessageWithStatus(
+            message: messageText,
+            timestamp: pendingMessages[index].timestamp,
+            status: success ? MessageStatus.sent : MessageStatus.failed,
+            isSent: true,
+          );
+        }
+      });
       
     } catch (e) {
       print('Error sending SMS: $e');
@@ -204,42 +316,6 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
     }
   }
 
-  Future<int?> _showSimSelectionDialog() async {
-    return showDialog<int>(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('Select SIM Card'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.sim_card, color: Colors.blue),
-                title: const Text('SIM 1'),
-                onTap: () {
-                  Navigator.pop(context, 0);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.sim_card, color: Colors.green),
-                title: const Text('SIM 2'),
-                onTap: () {
-                  Navigator.pop(context, 1);
-                },
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
   String _formatDate(int timestamp) {
     DateTime date = DateTime.fromMillisecondsSinceEpoch(timestamp);
     DateTime now = DateTime.now();
@@ -250,6 +326,44 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
       return 'Yesterday ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
     } else {
       return '${date.day}/${date.month}/${date.year} ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
+    }
+  }
+
+  String _formatDateTime(DateTime date) {
+    DateTime now = DateTime.now();
+    
+    if (date.year == now.year && date.month == now.month && date.day == now.day) {
+      return 'Today ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
+    } else if (date.year == now.year && date.month == now.month && date.day == now.day - 1) {
+      return 'Yesterday ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
+    } else {
+      return '${date.day}/${date.month}/${date.year} ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
+    }
+  }
+
+  Widget _buildStatusIcon(MessageStatus status) {
+    switch (status) {
+      case MessageStatus.sending:
+        return const SizedBox(
+          width: 16,
+          height: 16,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.white70),
+          ),
+        );
+      case MessageStatus.sent:
+        return const Icon(
+          Icons.check_circle,
+          size: 16,
+          color: Colors.green,
+        );
+      case MessageStatus.failed:
+        return const Icon(
+          Icons.watch_later,
+          size: 16,
+          color: Colors.red,
+        );
     }
   }
 
@@ -279,65 +393,120 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
             ),
           ],
         ),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        backgroundColor: const Color.fromARGB(255, 215, 215, 215), // Teal 700
+          foregroundColor: const Color.fromARGB(255, 0, 0, 0),
       ),
       body: Column(
         children: [
           Expanded(
-            child: sortedMessages.isEmpty
+            child: (sortedMessages.isEmpty && pendingMessages.isEmpty)
                 ? const Center(
                     child: Text('No messages'),
                   )
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.all(8),
-                    itemCount: sortedMessages.length,
+                    itemCount: sortedMessages.length + pendingMessages.length,
                     itemBuilder: (context, index) {
-                      AndroidSMSMessage message = sortedMessages[index];
-                      bool isReceived = message.type == 'inbox' || message.type == '1';
-                      
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 4),
-                        child: Align(
-                          alignment: isReceived ? Alignment.centerLeft : Alignment.centerRight,
-                          child: Container(
-                            constraints: BoxConstraints(
-                              maxWidth: MediaQuery.of(context).size.width * 0.75,
-                            ),
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            decoration: BoxDecoration(
-                              color: isReceived
-                                  ? Colors.grey[300]
-                                  : Theme.of(context).colorScheme.primaryContainer,
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  message.body,
-                                  style: TextStyle(
-                                    fontSize: 15,
-                                    color: isReceived
-                                        ? Colors.black87
-                                        : Theme.of(context).colorScheme.onPrimaryContainer,
+                      // Show existing messages first, then pending messages
+                      if (index < sortedMessages.length) {
+                        // Existing message
+                        AndroidSMSMessage message = sortedMessages[index];
+                        bool isReceived = message.type == 'inbox' || message.type == '1';
+                        
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Align(
+                            alignment: isReceived ? Alignment.centerLeft : Alignment.centerRight,
+                            child: Container(
+                              constraints: BoxConstraints(
+                                maxWidth: MediaQuery.of(context).size.width * 0.75,
+                              ),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: isReceived
+                                    ? Colors.grey[300]
+                                    : Theme.of(context).colorScheme.primaryContainer,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    message.body,
+                                    style: TextStyle(
+                                      fontSize: 15,
+                                      color: isReceived
+                                          ? Colors.black87
+                                          : Theme.of(context).colorScheme.onPrimaryContainer,
+                                    ),
                                   ),
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  _formatDate(message.date),
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: isReceived
-                                        ? Colors.black54
-                                        : Theme.of(context).colorScheme.onPrimaryContainer.withOpacity(0.7),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _formatDate(message.date),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: isReceived
+                                          ? Colors.black54
+                                          : Theme.of(context).colorScheme.onPrimaryContainer.withOpacity(0.7),
+                                    ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
                           ),
-                        ),
-                      );
+                        );
+                      } else {
+                        // Pending message
+                        MessageWithStatus pendingMsg = pendingMessages[index - sortedMessages.length];
+                        
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Align(
+                            alignment: Alignment.centerRight,
+                            child: Container(
+                              constraints: BoxConstraints(
+                                maxWidth: MediaQuery.of(context).size.width * 0.75,
+                              ),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: Theme.of(context).colorScheme.primaryContainer,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Flexible(
+                                        child: Text(
+                                          pendingMsg.message,
+                                          style: TextStyle(
+                                            fontSize: 15,
+                                            color: Theme.of(context).colorScheme.onPrimaryContainer,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      // Status icon
+                                      _buildStatusIcon(pendingMsg.status),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _formatDateTime(pendingMsg.timestamp),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Theme.of(context).colorScheme.onPrimaryContainer.withOpacity(0.7),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      }
                     },
                   ),
           ),
@@ -355,36 +524,112 @@ class _ShowSmsPageState extends State<ShowSmsPage> {
                   ),
                 ],
               ),
-              child: Row(
+              child: Column(
                 children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _messageController,
-                      decoration: InputDecoration(
-                        hintText: 'Type a message...',
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(24),
-                        ),
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 10,
+                  // SIM Selector - Show above message box
+                  if (simCards.isNotEmpty)
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: simCards.map((sim) {
+                          int slotIndex = sim.simSlotIndex ?? 0;
+                          String simLabel = sim.carrierName ?? 'SIM ${slotIndex + 1}';
+                          bool isSelected = selectedSim?.simSlotIndex == sim.simSlotIndex;
+                          Color simColor = slotIndex == 0 ? Colors.blue : Colors.purple;
+                          
+                          return Expanded(
+                            child: InkWell(
+                              onTap: () {
+                                setState(() {
+                                  selectedSim = sim;
+                                  selectedSimSlot = slotIndex;
+                                });
+                              },
+                              borderRadius: BorderRadius.circular(8),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    CircleAvatar(
+                                      radius: 10,
+                                      backgroundColor: simColor,
+                                      child: Text(
+                                        '${slotIndex + 1}',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Flexible(
+                                      child: Text(
+                                        simLabel,
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                          color: isSelected 
+                                            ? Theme.of(context).colorScheme.primary
+                                            : Theme.of(context).colorScheme.onSurface,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    if (isSelected)
+                                      Icon(
+                                        Icons.check_circle,
+                                        color: Theme.of(context).colorScheme.primary,
+                                        size: 18,
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _messageController,
+                          decoration: InputDecoration(
+                            hintText: 'Type a message...',
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(24),
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 10,
+                            ),
+                          ),
+                          maxLines: null,
+                          textCapitalization: TextCapitalization.sentences,
                         ),
                       ),
-                      maxLines: null,
-                      textCapitalization: TextCapitalization.sentences,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton(
-                    onPressed: _sendSms,
-                    icon: Icon(
-                      Icons.send,
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    style: IconButton.styleFrom(
-                      backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-                      padding: const EdgeInsets.all(12),
-                    ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        onPressed: _sendSms,
+                        icon: Icon(
+                          Icons.send,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                        style: IconButton.styleFrom(
+                          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                          padding: const EdgeInsets.all(12),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
