@@ -4,6 +4,7 @@ import 'package:telephony/telephony.dart';
 import 'package:sim_reader/sim_reader.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'show_sms.dart';
+import 'services/dual_sim_sms_service.dart';
 
 class ComposeSmsPage extends StatefulWidget {
   const ComposeSmsPage({super.key});
@@ -417,12 +418,34 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
 
   Future<void> _sendDirectSms(int simSlot) async {
     try {
-      String phoneNumber = widget.phoneNumber;
-      String message = _messageController.text;
+      // Clean and validate phone number
+      String phoneNumber = widget.phoneNumber.trim();
+      String message = _messageController.text.trim();
+      
+      // Validate inputs
+      if (phoneNumber.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Invalid phone number')),
+          );
+        }
+        return;
+      }
+      
+      if (message.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Please enter a message')),
+          );
+        }
+        return;
+      }
       
       print('Sending SMS to: $phoneNumber');
       print('Message: $message');
       print('SIM Slot: $simSlot');
+      print('Message length: ${message.length}');
+      print('Phone number length: ${phoneNumber.length}');
       
       // Request SMS permission first
       bool? permissionGranted = await telephony.requestSmsPermissions;
@@ -436,44 +459,80 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
         return;
       }
       
-      // Send SMS directly using telephony
-      await telephony.sendSms(
-        to: phoneNumber,
-        message: message,
-        statusListener: (SendStatus status) {
-          print('SMS Send Status: $status');
-          if (mounted) {
-            if (status == SendStatus.SENT) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Message sent successfully!')),
-              );
-              // Navigate to show_sms page with the conversation
-              Navigator.pushReplacement(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => ShowSmsPage(
-                    sender: widget.phoneNumber, // Pass phone number
-                    messages: [], // Will be loaded in ShowSmsPage from device
+      // Show sending indicator
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
                   ),
                 ),
-              );
-            } else if (status == SendStatus.DELIVERED) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Message delivered!')),
-              );
-            }
-          }
-        },
+                SizedBox(width: 16),
+                Text('Sending message...'),
+              ],
+            ),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+      
+      // Send SMS using the custom dual SIM implementation
+      bool success = await DualSimSmsService.sendSmsBySim(
+        phoneNumber: phoneNumber,
+        message: message,
+        simSlot: simSlot,
       );
       
-      // Clear message after sending attempt
-      _messageController.clear();
+      if (success && mounted) {
+        // Clear message after successful send
+        _messageController.clear();
+        
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Message sent successfully from SIM ${simSlot + 1}!'),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+        
+        // Navigate to show_sms page with the conversation after a short delay
+        Future.delayed(const Duration(milliseconds: 800), () {
+          if (mounted) {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (context) => ShowSmsPage(
+                  sender: widget.phoneNumber,
+                  messages: [],
+                ),
+              ),
+            );
+          }
+        });
+      }
       
     } catch (e) {
       print('Error sending SMS: $e');
       if (mounted) {
+        ScaffoldMessenger.of(context).clearSnackBars();
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to send SMS: $e')),
+          SnackBar(
+            content: Text('Failed to send SMS: ${e.toString()}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Retry',
+              textColor: Colors.white,
+              onPressed: () => _sendDirectSms(simSlot),
+            ),
+          ),
         );
       }
     }
