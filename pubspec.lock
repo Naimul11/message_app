@@ -240,6 +240,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.8"
+  sim_reader:
+    dependency: "direct main"
+    description:
+      name: sim_reader
+      sha256: dd55844d6e8b15a1d433af3a190816883844c936af96baf3ae1dec5bf0396bf5
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.4"
   sky_engine:
     dependency: transitive
     description: flutter

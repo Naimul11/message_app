@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:telephony/telephony.dart';
+import 'package:sim_reader/sim_reader.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'show_sms.dart';
 
 class ComposeSmsPage extends StatefulWidget {
@@ -264,7 +266,9 @@ class SmsComposeScreen extends StatefulWidget {
 class _SmsComposeScreenState extends State<SmsComposeScreen> {
   final TextEditingController _messageController = TextEditingController();
   final Telephony telephony = Telephony.instance;
-  List<Map<String, dynamic>> simCards = [];
+  List<SimInfo> simCards = [];
+  SimInfo? selectedSim;
+  bool isLoadingSims = true;
 
   @override
   void initState() {
@@ -280,15 +284,52 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
 
   Future<void> _loadSimCards() async {
     try {
-      // Use default SIM names for now
       setState(() {
-        simCards = [
-          {'slot': 0, 'name': 'SIM 1', 'carrier': ''},
-          {'slot': 1, 'name': 'SIM 2', 'carrier': ''},
-        ];
+        isLoadingSims = true;
       });
+
+      // Request phone permission for SIM info
+      PermissionStatus permissionStatus = await Permission.phone.request();
+      
+      if (!permissionStatus.isGranted) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Phone permission is required to read SIM information')),
+          );
+        }
+        setState(() {
+          isLoadingSims = false;
+        });
+        return;
+      }
+
+      // Get all SIM cards info
+      List<SimInfo> sims = await SimReader.getAllSimInfo();
+      
+      setState(() {
+        simCards = sims;
+        // Auto-select the first SIM if available
+        if (simCards.isNotEmpty) {
+          selectedSim = simCards[0];
+        }
+        isLoadingSims = false;
+      });
+
+      print('Loaded ${simCards.length} SIM cards');
+      for (var sim in simCards) {
+        print('SIM: ${sim.carrierName}, Slot: ${sim.simSlotIndex}, Number: ${sim.phoneNumber}');
+      }
     } catch (e) {
       print('Error loading SIM cards: $e');
+      setState(() {
+        isLoadingSims = false;
+      });
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error loading SIM cards: $e')),
+        );
+      }
     }
   }
 
@@ -300,8 +341,19 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
       return;
     }
 
-    // Show SIM selection dialog
-    _showSimSelectionDialog();
+    if (simCards.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No SIM cards detected')),
+      );
+      return;
+    }
+
+    // If multiple SIMs, show selection dialog, otherwise send directly
+    if (simCards.length > 1) {
+      _showSimSelectionDialog();
+    } else if (selectedSim != null) {
+      _sendDirectSms(selectedSim!.simSlotIndex ?? 0);
+    }
   }
 
   void _showSimSelectionDialog() {
@@ -309,19 +361,39 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
       context: context,
       builder: (BuildContext context) {
         return AlertDialog(
-          title: const Text('Select SIM'),
+          title: const Text('Select SIM card'),
+          contentPadding: const EdgeInsets.symmetric(vertical: 16),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: simCards.map((sim) {
+              int slotIndex = sim.simSlotIndex ?? 0;
+              String simLabel = sim.carrierName ?? 'SIM ${slotIndex + 1}';
+              String? simNumber = sim.phoneNumber;
+              
               return ListTile(
-                leading: const Icon(Icons.sim_card),
-                title: Text(sim['name'] ?? 'SIM ${sim['slot'] + 1}'),
-                subtitle: sim['carrier'] != null && sim['carrier'].toString().isNotEmpty
-                    ? Text(sim['carrier'].toString())
+                leading: CircleAvatar(
+                  backgroundColor: _getSimColor(slotIndex),
+                  child: Text(
+                    '${slotIndex + 1}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                title: Text(simLabel),
+                subtitle: simNumber != null && simNumber.isNotEmpty
+                    ? Text(simNumber)
+                    : const Text('No number'),
+                trailing: selectedSim?.simSlotIndex == sim.simSlotIndex
+                    ? const Icon(Icons.check_circle, color: Colors.green)
                     : null,
                 onTap: () {
                   Navigator.pop(context);
-                  _sendDirectSms(sim['slot'] as int);
+                  setState(() {
+                    selectedSim = sim;
+                  });
+                  _sendDirectSms(slotIndex);
                 },
               );
             }).toList(),
@@ -329,6 +401,18 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
         );
       },
     );
+  }
+
+  Color _getSimColor(int slotIndex) {
+    // Different colors for different SIM slots (like Google Messages)
+    switch (slotIndex) {
+      case 0:
+        return Colors.blue;
+      case 1:
+        return Colors.purple;
+      default:
+        return Colors.grey;
+    }
   }
 
   Future<void> _sendDirectSms(int simSlot) async {
@@ -461,6 +545,53 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
             ),
           ),
           
+          // SIM selection indicator (like Google Messages)
+          if (simCards.length > 1 && selectedSim != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                border: Border(
+                  bottom: BorderSide(
+                    color: Theme.of(context).colorScheme.outline.withOpacity(0.1),
+                  ),
+                ),
+              ),
+              child: InkWell(
+                onTap: _showSimSelectionDialog,
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 12,
+                      backgroundColor: _getSimColor(selectedSim!.simSlotIndex ?? 0),
+                      child: Text(
+                        '${(selectedSim!.simSlotIndex ?? 0) + 1}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      selectedSim!.carrierName ?? 'SIM ${(selectedSim!.simSlotIndex ?? 0) + 1}',
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: Theme.of(context).colorScheme.onSurface,
+                      ),
+                    ),
+                    const Spacer(),
+                    Icon(
+                      Icons.arrow_drop_down,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          
           // Spacer
           const Expanded(child: SizedBox()),
           
@@ -477,30 +608,61 @@ class _SmsComposeScreenState extends State<SmsComposeScreen> {
                 ),
               ],
             ),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
+            child: Column(
               children: [
-                Expanded(
-                  child: TextField(
-                    controller: _messageController,
-                    maxLines: 5,
-                    minLines: 1,
-                    decoration: InputDecoration(
-                      hintText: 'Message',
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(24),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
-                      ),
+                // Show loading or SIM count
+                if (isLoadingSims)
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 8.0),
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        SizedBox(width: 8),
+                        Text('Loading SIM information...', style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  )
+                else if (simCards.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8.0),
+                    child: Row(
+                      children: [
+                        Icon(Icons.warning, size: 16, color: Colors.orange),
+                        const SizedBox(width: 8),
+                        const Text('No SIM cards detected', style: TextStyle(fontSize: 12)),
+                      ],
                     ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                FloatingActionButton(
-                  onPressed: _sendSms,
-                  child: const Icon(Icons.send),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _messageController,
+                        maxLines: 5,
+                        minLines: 1,
+                        decoration: InputDecoration(
+                          hintText: 'Message',
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FloatingActionButton(
+                      onPressed: _sendSms,
+                      child: const Icon(Icons.send),
+                    ),
+                  ],
                 ),
               ],
             ),
