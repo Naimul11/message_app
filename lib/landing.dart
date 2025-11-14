@@ -4,6 +4,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'show_sms.dart';
 import 'compose_sms.dart';
+import 'spam_page.dart';
+import 'services/spam_detection_service.dart';
 
 class LandingPage extends StatefulWidget {
   const LandingPage({super.key});
@@ -19,6 +21,7 @@ class _LandingPageState extends State<LandingPage> {
   List<AndroidSMSMessage> allMessages = [];
   Map<String, List<AndroidSMSMessage>> groupedMessages = {};
   Map<String, String> contactNames = {}; // Cache contact names
+  Set<String> spamNumbers = {}; // Track spam phone numbers
 
   bool isLoading = true;
   bool hasPermission = false;
@@ -102,12 +105,54 @@ class _LandingPageState extends State<LandingPage> {
 
       // Load contact names in the background
       _loadContactNames();
+      
+      // Check inbox messages for spam
+      _checkMessagesForSpam(inboxMessages);
     } catch (e) {
       setState(() {
         errorText = 'Failed to load messages';
         isLoading = false;
       });
     }
+  }
+
+  Future<void> _checkMessagesForSpam(List<AndroidSMSMessage> inboxMessages) async {
+    print('Starting spam check for ${inboxMessages.length} messages');
+    
+    // Only check recent messages (last 10) to avoid overwhelming the API
+    final recentMessages = inboxMessages.take(10).toList();
+    print('Checking ${recentMessages.length} recent messages for spam');
+    
+    // Check each inbox message for spam
+    for (final message in recentMessages) {
+      final phoneNumber = message.address;
+      final messageText = message.body;
+      
+      print('Checking message from: $phoneNumber');
+      
+      // Skip if already marked as spam
+      if (spamNumbers.contains(phoneNumber)) {
+        print('Skipping $phoneNumber - already marked as spam');
+        continue;
+      }
+      
+      // Check for spam
+      final isSpam = await SpamDetectionService.checkAndSaveIfSpam(
+        messageText: messageText,
+        phoneNumber: phoneNumber,
+        contactName: contactNames[phoneNumber],
+      );
+      
+      print('Result for $phoneNumber: ${isSpam ? "SPAM" : "HAM"}');
+      
+      if (isSpam && mounted) {
+        setState(() {
+          spamNumbers.add(phoneNumber);
+        });
+      }
+    }
+    
+    print('Spam check completed');
   }
 
   Future<void> _loadContactNames() async {
@@ -181,6 +226,12 @@ class _LandingPageState extends State<LandingPage> {
               onSelected: (v) {
                 if (v == 'toggle_inbox')
                   setState(() => showOnlyInbox = !showOnlyInbox);
+                  else if (v == 'spam') {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => const SpamPage()),
+                    );
+                  }
               },
               itemBuilder: (context) => [
               CheckedPopupMenuItem(
@@ -188,6 +239,10 @@ class _LandingPageState extends State<LandingPage> {
                 checked: showOnlyInbox,
                 child: const Text('Show only Inbox'),
               ),
+                const PopupMenuItem(
+                  value: 'spam',
+                  child: Text('Spam'),
+                ),
             ],
           ),
         ],

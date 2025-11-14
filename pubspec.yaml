@@ -41,6 +41,8 @@ dependencies:
   flutter_contacts: ^1.1.9
   telephony: ^0.2.0
   sim_reader: ^1.0.4
+  firebase_core: ^4.2.1
+  cloud_firestore: 6.1.0
 
 dev_dependencies:
   flutter_test:
